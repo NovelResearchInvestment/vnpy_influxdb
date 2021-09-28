@@ -3,8 +3,6 @@ import ast
 from datetime import datetime
 from typing import List
 import shelve
-import warnings
-import pandas as pd
 
 import pandas as pd
 from influxdb_client import InfluxDBClient, Point
@@ -29,9 +27,6 @@ from vnpy.trader.utility import (
 import json, re
 import numpy as np
 import pytz
-
-
-warnings.simplefilter("ignore", MissingPivotFunction)
 
 
 class InfluxdbDatabase(BaseDatabase):
@@ -66,20 +61,13 @@ class InfluxdbDatabase(BaseDatabase):
         # self.client = InfluxDBClient(host, port, user, password, database)
         # self.client.create_database(database)
 
-        self.write_api: WriteApi = self.client.write_api(
-            write_options=SYNCHRONOUS
-        )
-        self.query_api: QueryApi = self.client.query_api()
-        self.delete_api: DeleteApi = self.client.delete_api()
-
     def save_bar_data(self, bars: List[BarData], stream: bool = False) -> bool:
         """保存K线数据"""
-        data: List[dict] = []
-
+        json_body = []
         # 读取主键参数
-        bar: BarData = bars[0]
-        vt_symbol: str = bar.vt_symbol
-        interval: Interval = bar.interval
+        bar = bars[0]
+        vt_symbol = bar.vt_symbol
+        interval = bar.interval
 
         # 将BarData数据转换为字典，并调整时区
         for bar in bars:
@@ -102,13 +90,9 @@ class InfluxdbDatabase(BaseDatabase):
                     "open_interest": float(bar.open_interest),
                 }
             }
-            data.append(d)
+            json_body.append(d)
 
-        self.write_api.write(
-            bucket=self.database,
-            org=self.user,
-            record=data
-        )
+        self.client.write_points(json_body, batch_size=10000)
 
         # 更新K线汇总数据
         symbol, exchange = extract_vt_symbol(vt_symbol)
@@ -133,22 +117,20 @@ class InfluxdbDatabase(BaseDatabase):
             overview.start = min(overview.start, bars[0].datetime)
             overview.end = max(overview.end, bars[-1].datetime)
 
-            query: str = f'''
-                from(bucket: "{self.database}")
-                    |> range(start: 2000-01-01T00:00:00Z, stop: {datetime.now().isoformat()}Z)
-                    |> filter(fn: (r) =>
-                        r._measurement == "bar_data" and
-                        r.interval == "{interval.value}" and
-                        r.vt_symbol == "{vt_symbol}" and
-                        r._field == "close_price"
-                    )
-                    |> count()
-                    |> yield(name: "count")
-            '''
-            df: DataFrame = self.query_api.query_data_frame(query)
+            query = (
+                "select count(close_price) from bar_data"
+                " where vt_symbol=$vt_symbol"
+                " and interval=$interval"
+            )
+            bind_params = {
+                "vt_symbol": vt_symbol,
+                "interval": interval.value
+            }
+            result = self.client.query(query, bind_params=bind_params)
+            points = result.get_points()
 
-            for tp in df.itertuples():
-                overview.count = tp._5
+            for d in points:
+                overview.count = d["count"]
 
         f[key] = overview
         f.close()
@@ -162,13 +144,14 @@ class InfluxdbDatabase(BaseDatabase):
             tick.datetime = convert_tz(tick.datetime)
             vt_symbol = tick.vt_symbol
             exchange = tick.exchange.value
+            if tick.localtime is None:
+                localtime = "Nan"
+            else:
+                localtime = tick.localtime
 
             vnpy_tick_fields = {n: getattr(tick, n, np.nan) for n in self.db_table_conf['vnpy']['tick']}
             vnpy_tick_fields['date'] = int(tick.datetime.strftime("%Y%m%d"))
             vnpy_tick_fields['time'] = int(tick.datetime.strftime("%H%M%S%f"))
-
-            if not tick.localtime:
-                tick.localtime = tick.datetime
 
             d: dict = {
                 "measurement": "tick_data",
@@ -291,6 +274,7 @@ class InfluxdbDatabase(BaseDatabase):
         self.write_api.write(bucket=self.bucket, org=self.org, record=points)
 
 
+
     def load_bar_data(
             self,
             symbol: str,
@@ -300,44 +284,38 @@ class InfluxdbDatabase(BaseDatabase):
             end: datetime
     ) -> List[BarData]:
         """读取K线数据"""
-        vt_symbol: str = generate_vt_symbol(symbol, exchange)
+        query = (
+            "select * from bar_data"
+            " where vt_symbol=$vt_symbol"
+            " and interval=$interval"
+            f" and time >= '{start.date().isoformat()}'"
+            f" and time <= '{end.date().isoformat()}';"
+        )
 
-        query: str = f'''
-            from(bucket: "{self.database}")
-                |> range(start: {start.isoformat()}Z, stop: {end.isoformat()}Z)
-                |> filter(fn: (r) =>
-                   r._measurement == "bar_data" and
-                   r.interval == "{interval.value}" and
-                   r.vt_symbol == "{vt_symbol}"
-                )
-                |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-        '''
+        bind_params = {
+            "vt_symbol": generate_vt_symbol(symbol, exchange),
+            "interval": interval.value
+        }
 
-        result = self.query_api.query_raw(query)
-
-        try:
-            df: pd.DataFrame = pd.read_csv(result)[3:]
-        except pd.errors.EmptyDataError:
-            return []
-
-        df["date_time"] = pd.to_datetime(df["dateTime:RFC3339.2"])
+        result = self.client.query(query, bind_params=bind_params)
+        points = result.get_points()
 
         bars: List[BarData] = []
-        for tp in df.itertuples():
-            dt: datetime = datetime.fromtimestamp(tp[17].timestamp(), tz=DB_TZ)
+        for d in points:
+            dt = datetime.strptime(d["time"], "%Y-%m-%dT%H:%M:%SZ")
 
             bar: BarData = BarData(
                 symbol=symbol,
                 exchange=exchange,
                 interval=interval,
-                datetime=dt,
-                open_price=float(tp[14]),
-                high_price=float(tp[11]),
-                low_price=float(tp[12]),
-                close_price=float(tp[10]),
-                volume=float(tp[16]),
-                turnover=float(tp[15]),
-                open_interest=float(tp[13]),
+                datetime=datetime.fromtimestamp(dt.timestamp(), DB_TZ),
+                open_price=d["open_price"],
+                high_price=d["high_price"],
+                low_price=d["low_price"],
+                close_price=d["close_price"],
+                volume=d["volume"],
+                turnover=d["turnover"],
+                open_interest=d["open_interest"],
                 gateway_name="DB"
             )
             bars.append(bar)
@@ -351,35 +329,30 @@ class InfluxdbDatabase(BaseDatabase):
         interval: Interval
     ) -> int:
         """删除K线数据"""
-        vt_symbol: str = generate_vt_symbol(symbol, exchange)
+        bind_params = {
+            "vt_symbol": generate_vt_symbol(symbol, exchange),
+            "interval": interval.value
+        }
 
         # 查询数量
-        query1: str = f'''
-            from(bucket: "{self.database}")
-                |> range(start: 2000-01-01T00:00:00Z, stop: {datetime.now().isoformat()}Z)
-                |> filter(fn: (r) =>
-                    r._measurement == "bar_data" and
-                    r.interval == "{interval.value}" and
-                    r.vt_symbol == "{vt_symbol}" and
-                    r._field == "close_price"
-                )
-                |> count()
-                |> yield(name: "count")
-        '''
+        query1 = (
+            "select count(close_price) from bar_data"
+            " where vt_symbol=$vt_symbol"
+            " and interval=$interval"
+        )
+        result = self.client.query(query1, bind_params=bind_params)
+        points = result.get_points()
 
-        df: DataFrame = self.query_api.query_data_frame(query1)
-        count: int = 0
-        for tp in df.itertuples():
-            count = tp._5
+        for d in points:
+            count = d["count"]
 
         # 删除K线数据
-        self.delete_api.delete(
-            "2000-01-01T00:00:00Z",
-            datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
-            f'interval="{interval.value}" and vt_symbol="{vt_symbol}"',
-            bucket=self.database,
-            org=self.user
+        query2 = (
+            "drop series from bar_data"
+            " where vt_symbol=$vt_symbol"
+            " and interval=$interval"
         )
+        self.client.query(query2, bind_params=bind_params)
 
         # 删除K线汇总数据
         f: shelve.DbfilenameShelf = shelve.open(self.bar_overview_filepath)
@@ -431,33 +404,27 @@ class InfluxdbDatabase(BaseDatabase):
         exchange: Exchange
     ) -> int:
         """删除TICK数据"""
-        vt_symbol: str = generate_vt_symbol(symbol, exchange)
+        bind_params = {
+            "vt_symbol": generate_vt_symbol(symbol, exchange),
+        }
 
-        # 查询数量
-        query1: str = f'''
-            from(bucket: "{self.database}")
-                |> range(start: 2000-01-01T00:00:00Z, stop: {datetime.now().isoformat()}Z)
-                |> filter(fn: (r) =>
-                    r._measurement == "tick_data" and
-                    r.vt_symbol == "{vt_symbol}" and
-                    r._field == "last_price"
-                )
-                |> count()
-                |> yield(name: "count")
-        '''
-        df: DataFrame = self.query_api.query_data_frame(query1)
-        count: int = 0
-        for tp in df.itertuples():
-            count = tp._5
-
-        # 删除K线数据
-        self.delete_api.delete(
-            "2000-01-01T00:00:00Z",
-            datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
-            f'vt_symbol="{vt_symbol}"',
-            bucket=self.database,
-            org=self.user
+        # 查询TICK数量
+        query1 = (
+            "select count(last_price) from tick_data"
+            " where vt_symbol=$vt_symbol"
         )
+        result = self.client.query(query1, bind_params=bind_params)
+        points = result.get_points()
+
+        for d in points:
+            count = d["count"]
+
+        # 删除TICK数据
+        query2 = (
+            "drop series from tick_data"
+            " where vt_symbol=$vt_symbol"
+        )
+        self.client.query(query2, bind_params=bind_params)
 
         # 删除K线汇总数据
         f = shelve.open(self.tick_overview_filepath)
@@ -471,7 +438,20 @@ class InfluxdbDatabase(BaseDatabase):
 
     def get_bar_overview(self) -> List[BarOverview]:
         """查询数据库中的K线汇总信息"""
-        f: shelve.DbfilenameShelf = shelve.open(self.bar_overview_filepath)
+        # 如果已有K线，但缺失汇总信息，则执行初始化
+        query = "select count(close_price) from bar_data"
+        result = self.client.query(query)
+        points = result.get_points()
+        data_count = 0
+        for d in points:
+            data_count = d["count"]
+
+        f = shelve.open(self.overview_filepath)
+        overview_count = len(f)
+
+        if data_count and not overview_count:
+            self.init_bar_overview()
+
         overviews = list(f.values())
         f.close()
         return overviews
