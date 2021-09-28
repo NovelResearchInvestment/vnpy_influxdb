@@ -61,6 +61,17 @@ class InfluxdbDatabase(BaseDatabase):
         # self.client = InfluxDBClient(host, port, user, password, database)
         # self.client.create_database(database)
 
+        self.client = InfluxDBClient(url=url, token=token)
+        # self.bucket_api = self.client.buckets_api()
+        # if self.bucket_api.find_bucket_by_name(self.bucket) is None:
+        #     self.bucket_api.create_bucket(bucket_name=self.bucket)
+
+        # self.write_api = self.client.write_api(write_options=WriteOptions(batch_size=500, flush_interval=10_000, jitter_interval=2_000, retry_interval=5_000))
+        self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
+        self.query_api = self.client.query_api()
+        # self.client = InfluxDBClient(host, port, user, password, database)
+        # self.client.create_database(database)
+
     def save_bar_data(self, bars: List[BarData], stream: bool = False) -> bool:
         """保存K线数据"""
         json_body = []
@@ -152,8 +163,14 @@ class InfluxdbDatabase(BaseDatabase):
             tick.datetime = convert_tz(tick.datetime)
             vt_symbol = tick.vt_symbol
             exchange = tick.exchange.value
-            if not tick.localtime:
-                tick.localtime = tick.datetime
+            if tick.localtime is None:
+                localtime = "Nan"
+            else:
+                localtime = tick.localtime
+
+            vnpy_tick_fields = {n: getattr(tick, n, np.nan) for n in self.db_table_conf['vnpy']['tick']}
+            vnpy_tick_fields['date'] = int(tick.datetime.strftime("%Y%m%d"))
+            vnpy_tick_fields['time'] = int(tick.datetime.strftime("%H%M%S%f"))
 
             vnpy_tick_fields = {n: getattr(tick, n, np.nan) for n in self.db_table_conf['vnpy']['tick']}
             vnpy_tick_fields['dateint'] = int(tick.datetime.strftime("%Y%m%d"))
@@ -433,14 +450,6 @@ class InfluxdbDatabase(BaseDatabase):
             " where vt_symbol=$vt_symbol"
         )
         self.client.query(query2, bind_params=bind_params)
-
-        # 删除K线汇总数据
-        f = shelve.open(self.tick_overview_filepath)
-        vt_symbol = generate_vt_symbol(symbol, exchange)
-        key = f"{vt_symbol}"
-        if key in f:
-            f.pop(key)
-        f.close()
 
         return count
 
