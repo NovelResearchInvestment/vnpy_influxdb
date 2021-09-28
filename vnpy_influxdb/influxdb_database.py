@@ -144,6 +144,14 @@ class InfluxdbDatabase(BaseDatabase):
             tick.datetime = convert_tz(tick.datetime)
             vt_symbol = tick.vt_symbol
             exchange = tick.exchange.value
+
+            vnpy_tick_fields = {n: getattr(tick, n, np.nan) for n in self.db_table_conf['vnpy']['tick']}
+            vnpy_tick_fields['date'] = int(tick.datetime.strftime("%Y%m%d"))
+            vnpy_tick_fields['time'] = int(tick.datetime.strftime("%H%M%S%f"))
+
+            tick.datetime = convert_tz(tick.datetime)
+            vt_symbol = tick.vt_symbol
+            exchange = tick.exchange.value
             if not tick.localtime:
                 tick.localtime = tick.datetime
 
