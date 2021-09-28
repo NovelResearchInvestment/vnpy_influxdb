@@ -1,3 +1,5 @@
+""""""
+import ast
 from datetime import datetime
 from typing import List
 import shelve
@@ -13,7 +15,7 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 from pandas import DataFrame
 
 from vnpy.trader.constant import Exchange, Interval
-from vnpy.trader.object import BarData, TickData
+from vnpy.trader.object import BarData, TickData, OrderData, TradeData, PositionData, AccountData
 from vnpy.trader.database import (
     BaseDatabase,
     BarOverview,
@@ -26,6 +28,10 @@ from vnpy.trader.utility import (
     extract_vt_symbol,
     get_file_path
 )
+
+import json, re
+import numpy as np
+import pytz
 
 
 class InfluxdbDatabase(BaseDatabase):
@@ -144,7 +150,14 @@ class InfluxdbDatabase(BaseDatabase):
         vt_symbol: str = tick.vt_symbol
 
         for tick in ticks:
+
             tick.datetime = convert_tz(tick.datetime)
+            vt_symbol = tick.vt_symbol
+            exchange = tick.exchange.value
+
+            vnpy_tick_fields = {n: getattr(tick, n, np.nan) for n in self.db_table_conf['vnpy']['tick']}
+            vnpy_tick_fields['date'] = int(tick.datetime.strftime("%Y%m%d"))
+            vnpy_tick_fields['time'] = int(tick.datetime.strftime("%H%M%S%f"))
 
             if not tick.localtime:
                 tick.localtime = tick.datetime
@@ -152,7 +165,8 @@ class InfluxdbDatabase(BaseDatabase):
             d = {
                 "measurement": "tick_data",
                 "tags": {
-                    "vt_symbol": vt_symbol
+                    "symbol": vt_symbol,
+                    "exchange": exchange
                 },
                 "time": tick.datetime.isoformat(),
                 "fields": {
@@ -208,12 +222,12 @@ class InfluxdbDatabase(BaseDatabase):
         return True
 
     def load_bar_data(
-        self,
-        symbol: str,
-        exchange: Exchange,
-        interval: Interval,
-        start: datetime,
-        end: datetime
+            self,
+            symbol: str,
+            exchange: Exchange,
+            interval: Interval,
+            start: datetime,
+            end: datetime
     ) -> List[BarData]:
         """读取K线数据"""
         vt_symbol: str = generate_vt_symbol(symbol, exchange)
@@ -377,6 +391,39 @@ class InfluxdbDatabase(BaseDatabase):
 
         return count
 
+    def load_tick_data(
+        self,
+        symbol: str,
+        exchange: Exchange,
+        start: datetime,
+        end: datetime,
+        fields: list
+    ) -> List[TickData]:
+        """读取TICK数据"""
+
+        query = f"""
+        from(bucket: "{self.bucket}")
+            |> range(start: start, stop: end)
+            |> filter(fn: (r) => r["_measurement"] == "tick_data")
+            |> filter(fn: (r) => r["symbol"] == "{symbol}")
+            |> filter(fn: (r) => r["exchange"] == "{exchange}")
+            |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+        """
+
+        if len(fields) > 0:
+            fields_str = ','.join([f'"{f}"' for f in fields])
+            query += f"""|> keep(columns: [{fields_str}])"""
+
+        bind_params = {
+            "start": start,
+            "end": end,
+        }
+
+        tables = self.query_api.query(query, params=bind_params, org=self.org)
+        ticks_df = pd.DataFrame([record.values for table in tables for record in table.records])
+
+        return ticks_df
+
     def delete_tick_data(
         self,
         symbol: str,
@@ -419,3 +466,6 @@ class InfluxdbDatabase(BaseDatabase):
         overviews = list(f.values())
         f.close()
         return overviews
+
+
+database_manager = InfluxdbDatabase()
