@@ -131,6 +131,8 @@ class InfluxdbDatabase(BaseDatabase):
         f[key] = overview
         f.close()
 
+        return True
+
     def save_tick_data(self, ticks: List[TickData]) -> bool:
         """保存TICK数据"""
         points = []
@@ -140,6 +142,10 @@ class InfluxdbDatabase(BaseDatabase):
             tick.datetime = convert_tz(tick.datetime)
             vt_symbol = tick.vt_symbol
             exchange = tick.exchange.value
+            if tick.localtime is None:
+                localtime = "Nan"
+            else:
+                localtime = tick.localtime
 
             vnpy_tick_fields = {n: getattr(tick, n, np.nan) for n in self.db_table_conf['vnpy']['tick']}
             vnpy_tick_fields['date'] = int(tick.datetime.strftime("%Y%m%d"))
@@ -265,6 +271,8 @@ class InfluxdbDatabase(BaseDatabase):
 
         self.write_api.write(bucket=self.bucket, org=self.org, record=points)
 
+
+        return True
 
     def load_bar_data(
             self,
