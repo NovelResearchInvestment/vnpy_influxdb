@@ -80,13 +80,13 @@ class InfluxdbDatabase(BaseDatabase):
                 },
                 "time": bar.datetime.isoformat(),
                 "fields": {
-                    "open_price": bar.open_price,
-                    "high_price": bar.high_price,
-                    "low_price": bar.low_price,
-                    "close_price": bar.close_price,
-                    "volume": bar.volume,
-                    "turnover": bar.turnover,
-                    "open_interest": bar.open_interest,
+                    "open_price": float(bar.open_price),
+                    "high_price": float(bar.high_price),
+                    "low_price": float(bar.low_price),
+                    "close_price": float(bar.close_price),
+                    "volume": float(bar.volume),
+                    "turnover": float(bar.turnover),
+                    "open_interest": float(bar.open_interest),
                 }
             }
             json_body.append(d)
@@ -157,8 +157,48 @@ class InfluxdbDatabase(BaseDatabase):
                     "symbol": vt_symbol,
                     "exchange": exchange
                 },
-                "time": tick.datetime.astimezone(pytz.timezone('Asia/Shanghai')),
-                "fields": vnpy_tick_fields
+                "time": tick.datetime.isoformat(),
+                "fields": {
+                    "name": tick.name,
+                    "volume": float(tick.volume),
+                    "turnover": float(tick.turnover),
+                    "open_interest": float(tick.open_interest),
+                    "last_price": float(tick.last_price),
+                    "last_volume": float(tick.last_volume),
+                    "limit_up": float(tick.limit_up),
+                    "limit_down": float(tick.limit_down),
+
+                    "open_price": float(tick.open_price),
+                    "high_price": float(tick.high_price),
+                    "low_price": float(tick.low_price),
+                    "pre_close": float(tick.pre_close),
+
+                    "bid_price_1": float(tick.bid_price_1),
+                    "bid_price_2": float(tick.bid_price_2),
+                    "bid_price_3": float(tick.bid_price_3),
+                    "bid_price_4": float(tick.bid_price_4),
+                    "bid_price_5": float(tick.bid_price_5),
+
+                    "ask_price_1": float(tick.ask_price_1),
+                    "ask_price_2": float(tick.ask_price_2),
+                    "ask_price_3": float(tick.ask_price_3),
+                    "ask_price_4": float(tick.ask_price_4),
+                    "ask_price_5": float(tick.ask_price_5),
+
+                    "bid_volume_1": float(tick.bid_volume_1),
+                    "bid_volume_2": float(tick.bid_volume_2),
+                    "bid_volume_3": float(tick.bid_volume_3),
+                    "bid_volume_4": float(tick.bid_volume_4),
+                    "bid_volume_5": float(tick.bid_volume_5),
+
+                    "ask_volume_1": float(tick.ask_volume_1),
+                    "ask_volume_2": float(tick.ask_volume_2),
+                    "ask_volume_3": float(tick.ask_volume_3),
+                    "ask_volume_4": float(tick.ask_volume_4),
+                    "ask_volume_5": float(tick.ask_volume_5),
+
+                    "localtime": tick.localtime.timestamp()
+                }
             }
             points.append(Point.from_dict(d))
 
@@ -307,14 +347,14 @@ class InfluxdbDatabase(BaseDatabase):
                 symbol=symbol,
                 exchange=exchange,
                 interval=interval,
-                datetime=datetime.fromtimestamp(dt.timestamp(), DB_TZ),
-                open_price=d["open_price"],
-                high_price=d["high_price"],
-                low_price=d["low_price"],
-                close_price=d["close_price"],
-                volume=d["volume"],
-                turnover=d["turnover"],
-                open_interest=d["open_interest"],
+                datetime=dt,
+                open_price=float(tp[14]),
+                high_price=float(tp[11]),
+                low_price=float(tp[12]),
+                close_price=float(tp[10]),
+                volume=float(tp[16]),
+                turnover=float(tp[15]),
+                open_interest=float(tp[13]),
                 gateway_name="DB"
             )
             bars.append(bar)
