@@ -1,18 +1,23 @@
-""""""
-import ast
 from datetime import datetime
 from typing import List
 import shelve
-
 import pandas as pd
-from influxdb_client import InfluxDBClient, Point
-from influxdb_client.client.write_api import WriteOptions, SYNCHRONOUS, WritePrecision
+
+from influxdb_client import (
+    InfluxDBClient,
+    WriteApi,
+    QueryApi,
+    DeleteApi
+)
+from influxdb_client.client.write_api import SYNCHRONOUS
+from pandas import DataFrame
 
 from vnpy.trader.constant import Exchange, Interval
-from vnpy.trader.object import BarData, TickData, OrderData, TradeData, PositionData, AccountData
+from vnpy.trader.object import BarData, TickData
 from vnpy.trader.database import (
     BaseDatabase,
     BarOverview,
+    TickOverview,
     DB_TZ,
     convert_tz
 )
@@ -23,50 +28,45 @@ from vnpy.trader.utility import (
     get_file_path
 )
 
-import json, re
-import numpy as np
-import pytz
-
 
 class InfluxdbDatabase(BaseDatabase):
     """InfluxDB数据库接口"""
-    # overview_filename = "influxdb_overview"
-    # overview_filepath = str(get_file_path(overview_filename))
+
+    bar_overview_filename = "influxdb_baroverview"
+    bar_overview_filepath = str(get_file_path(bar_overview_filename))
+
+    tick_overview_filename = "influxdb_tickoverview"
+    tick_overview_filepath = str(get_file_path(tick_overview_filename))
 
     def __init__(self) -> None:
         """"""
-        # database = SETTINGS["database.database"]
-        # user = SETTINGS["database.user"]
-        # password = SETTINGS["database.password"]
-        # host = SETTINGS["database.host"]
-        # port = SETTINGS["database.port"]
+        self.database: str = SETTINGS["database.database"]
+        self.user: str = SETTINGS["database.user"]
+        self.password: str = SETTINGS["database.password"]
+        self.host: str = SETTINGS["database.host"]
+        self.port: int = SETTINGS["database.port"]
 
-        url = SETTINGS["database.url"]
-        token = SETTINGS["database.token"]
-        self.org = SETTINGS["database.org"]
-        self.bucket = SETTINGS["database.bucket"]
+        self.client: InfluxDBClient = InfluxDBClient(
+            url=f"http://{self.host}:{self.port}",
+            token=self.password,
+            timeout=36000000,
+            org=self.user
+        )
 
-        with open(SETTINGS['database.tableconf'], 'r') as f:
-            self.db_table_conf = json.loads(f.read())
+        self.write_api: WriteApi = self.client.write_api(
+            write_options=SYNCHRONOUS
+        )
+        self.query_api: QueryApi = self.client.query_api()
+        self.delete_api: DeleteApi = self.client.delete_api()
 
-        self.client = InfluxDBClient(url=url, token=token)
-        # self.bucket_api = self.client.buckets_api()
-        # if self.bucket_api.find_bucket_by_name(self.bucket) is None:
-        #     self.bucket_api.create_bucket(bucket_name=self.bucket)
-
-        # self.write_api = self.client.write_api(write_options=WriteOptions(batch_size=500, flush_interval=10_000, jitter_interval=2_000, retry_interval=5_000))
-        self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
-        self.query_api = self.client.query_api()
-        # self.client = InfluxDBClient(host, port, user, password, database)
-        # self.client.create_database(database)
-
-    def save_bar_data(self, bars: List[BarData]) -> bool:
+    def save_bar_data(self, bars: List[BarData], stream: bool = False) -> bool:
         """保存K线数据"""
-        json_body = []
+        data: List[dict] = []
+
         # 读取主键参数
-        bar = bars[0]
-        vt_symbol = bar.vt_symbol
-        interval = bar.interval
+        bar: BarData = bars[0]
+        vt_symbol: str = bar.vt_symbol
+        interval: Interval = bar.interval
 
         # 将BarData数据转换为字典，并调整时区
         for bar in bars:
@@ -89,15 +89,19 @@ class InfluxdbDatabase(BaseDatabase):
                     "open_interest": float(bar.open_interest),
                 }
             }
-            json_body.append(d)
+            data.append(d)
 
-        self.client.write_points(json_body, batch_size=10000)
+        self.write_api.write(
+            bucket=self.database,
+            org=self.user,
+            record=data
+        )
 
         # 更新K线汇总数据
         symbol, exchange = extract_vt_symbol(vt_symbol)
         key = f"{vt_symbol}_{interval.value}"
 
-        f = shelve.open(self.overview_filepath)
+        f = shelve.open(self.bar_overview_filepath)
         overview = f.get(key, None)
 
         if not overview:
@@ -109,53 +113,53 @@ class InfluxdbDatabase(BaseDatabase):
             overview.count = len(bars)
             overview.start = bars[0].datetime
             overview.end = bars[-1].datetime
+        elif stream:
+            overview.end = bars[-1].datetime
+            overview.count += len(bars)
         else:
             overview.start = min(overview.start, bars[0].datetime)
             overview.end = max(overview.end, bars[-1].datetime)
 
-            query = (
-                "select count(close_price) from bar_data"
-                " where vt_symbol=$vt_symbol"
-                " and interval=$interval"
-            )
-            bind_params = {
-                "vt_symbol": vt_symbol,
-                "interval": interval.value
-            }
-            result = self.client.query(query, bind_params=bind_params)
-            points = result.get_points()
+            query: str = f'''
+                from(bucket: "{self.database}")
+                    |> range(start: 2000-01-01T00:00:00Z, stop: {datetime.now().isoformat()}Z)
+                    |> filter(fn: (r) =>
+                        r._measurement == "bar_data" and
+                        r.interval == "{interval.value}" and
+                        r.vt_symbol == "{vt_symbol}" and
+                        r._field == "close_price"
+                    )
+                    |> count()
+                    |> yield(name: "count")
+            '''
+            df: DataFrame = self.query_api.query_data_frame(query)
 
-            for d in points:
-                overview.count = d["count"]
+            for tp in df.itertuples():
+                overview.count = tp._5
 
         f[key] = overview
         f.close()
 
         return True
 
-    def save_tick_data(self, ticks: List[TickData]) -> bool:
+    def save_tick_data(self, ticks: List[TickData], stream: bool = False) -> bool:
         """保存TICK数据"""
-        points = []
+        data: List[dict] = []
+
+        # 读取主键参数
+        tick = ticks[0]
+        vt_symbol: str = tick.vt_symbol
 
         for tick in ticks:
-
             tick.datetime = convert_tz(tick.datetime)
-            vt_symbol = tick.vt_symbol
-            exchange = tick.exchange.value
+
             if not tick.localtime:
                 tick.localtime = tick.datetime
-
-            vnpy_tick_fields = {n: getattr(tick, n, np.nan) for n in self.db_table_conf['vnpy']['tick']}
-            vnpy_tick_fields['dateint'] = int(tick.datetime.strftime("%Y%m%d"))
-            vnpy_tick_fields['timeint'] = int(tick.datetime.strftime("%H%M%S%f"))
-            vnpy_tick_fields['datetimeiso'] = tick.datetime.isoformat()
-            vnpy_tick_fields['localtime'] = tick.localtime.timestamp()
 
             d = {
                 "measurement": "tick_data",
                 "tags": {
-                    "symbol": vt_symbol,
-                    "exchange": exchange
+                    "vt_symbol": vt_symbol
                 },
                 "time": tick.datetime.isoformat(),
                 "fields": {
@@ -200,148 +204,88 @@ class InfluxdbDatabase(BaseDatabase):
                     "localtime": tick.localtime.timestamp()
                 }
             }
-            points.append(Point.from_dict(d))
+            data.append(d)
 
-        self.write_api.write(bucket=self.bucket, org=self.org, record=points)
+        self.write_api.write(
+            bucket=self.database,
+            org=self.user,
+            record=data
+        )
 
+        # 更新Tick汇总数据
+        symbol, exchange = extract_vt_symbol(vt_symbol)
+        key = f"{vt_symbol}"
 
-    # TODO add save order
-    # TODO add save trade
-    # TODO add save position
-    # TODO add save account
-    # load tick data
+        f = shelve.open(self.tick_overview_filepath)
+        overview = f.get(key, None)
 
-    def save_order_data(self, orders: List[OrderData]) -> bool:
-        points = []
+        if not overview:
+            overview = TickOverview(
+                symbol=symbol,
+                exchange=exchange
+            )
+            overview.count = len(ticks)
+            overview.start = ticks[0].datetime
+            overview.end = ticks[-1].datetime
+        elif stream:
+            overview.end = ticks[-1].datetime
+            overview.count += len(ticks)
+        else:
+            overview.start = min(overview.start, ticks[0].datetime)
+            overview.end = max(overview.end, ticks[-1].datetime)
 
-        for order in orders:
-            order.datetime = convert_tz(order.datetime)
-            vt_symbol = order.vt_symbol
-            exchange = order.exchange.value
+            query: str = f'''
+                from(bucket: "{self.database}")
+                    |> range(start: 2000-01-01T00:00:00Z, stop: {datetime.now().isoformat()}Z)
+                    |> filter(fn: (r) =>
+                        r._measurement == "tick_data" and
+                        r.vt_symbol == "{vt_symbol}" and
+                        r._field == "close_price"
+                    )
+                    |> count()
+                    |> yield(name: "count")
+            '''
+            df: DataFrame = self.query_api.query_data_frame(query)
 
-            # vnpy_tick_fields = {n: getattr(tick, n, np.nan) for n in self.db_table_conf['vnpy']['tick']}
-            # vnpy_tick_fields['date'] = int(tick.datetime.strftime("%Y%m%d"))
-            # vnpy_tick_fields['time'] = int(tick.datetime.strftime("%H%M%S%f"))
+            for tp in df.itertuples():
+                overview.count = tp._5
 
-            # d = {
-            #     "measurement": "order_data",
-            #     "tags": {
-            #         "symbol": vt_symbol,
-            #         "exchange": exchange
-            #     },
-            #     "time": order.datetime.astimezone(pytz.timezone('Asia/Shanghai')),
-            #     "fields": vnpy_tick_fields
-            # }
-            # points.append(Point.from_dict(d))
-
-        self.write_api.write(bucket=self.bucket, org=self.org, record=points)
-
-    def save_trade_data(self, trades: List[TradeData]) -> bool:
-        points = []
-
-        for trade in trades:
-            trade.datetime = convert_tz(trade.datetime)
-            vt_symbol = trade.vt_symbol
-            exchange = trade.exchange.value
-
-            # vnpy_tick_fields = {n: getattr(tick, n, np.nan) for n in self.db_table_conf['vnpy']['tick']}
-            # vnpy_tick_fields['date'] = int(tick.datetime.strftime("%Y%m%d"))
-            # vnpy_tick_fields['time'] = int(tick.datetime.strftime("%H%M%S%f"))
-
-            # d = {
-            #     "measurement": "trade_data",
-            #     "tags": {
-            #         "symbol": vt_symbol,
-            #         "exchange": exchange
-            #     },
-            #     "time": trade.datetime.astimezone(pytz.timezone('Asia/Shanghai')),
-            #     "fields": vnpy_tick_fields
-            # }
-            # points.append(Point.from_dict(d))
-
-        self.write_api.write(bucket=self.bucket, org=self.org, record=points)
-
-    def save_position_data(self, positions: List[PositionData]) -> bool:
-        points = []
-
-        for position in positions:
-            position.datetime = convert_tz(position.datetime)
-            vt_symbol = position.vt_symbol
-            exchange = position.exchange.value
-
-            # vnpy_tick_fields = {n: getattr(tick, n, np.nan) for n in self.db_table_conf['vnpy']['tick']}
-            # vnpy_tick_fields['date'] = int(tick.datetime.strftime("%Y%m%d"))
-            # vnpy_tick_fields['time'] = int(tick.datetime.strftime("%H%M%S%f"))
-
-            # d = {
-            #     "measurement": "position_data",
-            #     "tags": {
-            #         "symbol": vt_symbol,
-            #         "exchange": exchange
-            #     },
-            #     "time": position.datetime.astimezone(pytz.timezone('Asia/Shanghai')),
-            #     "fields": vnpy_tick_fields
-            # }
-            # points.append(Point.from_dict(d))
-
-        self.write_api.write(bucket=self.bucket, org=self.org, record=points)
-
-    def save_account_data(self, accounts: List[AccountData]) -> bool:
-        points = []
-
-        for account in accounts:
-            account.datetime = convert_tz(account.datetime)
-            vt_symbol = account.vt_symbol
-            exchange = account.exchange.value
-
-            # vnpy_tick_fields = {n: getattr(tick, n, np.nan) for n in self.db_table_conf['vnpy']['tick']}
-            # vnpy_tick_fields['date'] = int(tick.datetime.strftime("%Y%m%d"))
-            # vnpy_tick_fields['time'] = int(tick.datetime.strftime("%H%M%S%f"))
-
-            # d = {
-            #     "measurement": "account_data",
-            #     "tags": {
-            #         "symbol": vt_symbol,
-            #         "exchange": exchange
-            #     },
-            #     "time": account.datetime.astimezone(pytz.timezone('Asia/Shanghai')),
-            #     "fields": vnpy_tick_fields
-            # }
-            # points.append(Point.from_dict(d))
-
-        self.write_api.write(bucket=self.bucket, org=self.org, record=points)
-
+        f[key] = overview
+        f.close()
 
         return True
 
     def load_bar_data(
-            self,
-            symbol: str,
-            exchange: Exchange,
-            interval: Interval,
-            start: datetime,
-            end: datetime
+        self,
+        symbol: str,
+        exchange: Exchange,
+        interval: Interval,
+        start: datetime,
+        end: datetime
     ) -> List[BarData]:
         """读取K线数据"""
-        query = (
-            "select * from bar_data"
-            " where vt_symbol=$vt_symbol"
-            " and interval=$interval"
-            f" and time >= '{start.date().isoformat()}'"
-            f" and time <= '{end.date().isoformat()}';"
-        )
+        vt_symbol: str = generate_vt_symbol(symbol, exchange)
 
-        bind_params = {
-            "vt_symbol": generate_vt_symbol(symbol, exchange),
-            "interval": interval.value
-        }
+        query: str = f'''
+            from(bucket: "{self.database}")
+                |> range(start: {start.isoformat()}Z, stop: {end.isoformat()}Z)
+                |> filter(fn: (r) =>
+                   r._measurement == "bar_data" and
+                   r.interval == "{interval.value}" and
+                   r.vt_symbol == "{vt_symbol}"
+                )
+                |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+        '''
 
-        result = self.client.query(query, bind_params=bind_params)
-        points = result.get_points()
+        result = self.query_api.query_raw(query)
+
+        df: pd.DataFrame = pd.read_csv(result)[3:]
+
+        df["date_time"] = pd.to_datetime(df["dateTime:RFC3339.2"])
 
         bars: List[BarData] = []
-        for d in points:
-            dt = datetime.strptime(d["time"], "%Y-%m-%dT%H:%M:%SZ")
+        for tp in df.itertuples():
+            dt = datetime.fromtimestamp(tp[17].timestamp(), tz=DB_TZ)
 
             bar = BarData(
                 symbol=symbol,
@@ -361,6 +305,79 @@ class InfluxdbDatabase(BaseDatabase):
 
         return bars
 
+    def load_tick_data(
+        self,
+        symbol: str,
+        exchange: Exchange,
+        start: datetime,
+        end: datetime
+    ) -> List[TickData]:
+        """读取TICK数据"""
+        vt_symbol: str = generate_vt_symbol(symbol, exchange)
+
+        query: str = f'''
+            from(bucket: "{self.database}")
+                |> range(start: {start.isoformat()}Z, stop: {end.isoformat()}Z)
+                |> filter(fn: (r) =>
+                   r._measurement == "tick_data" and
+                   r.vt_symbol == "{vt_symbol}"
+                )
+                |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+        '''
+
+        result = self.query_api.query_raw(query)
+
+        df: pd.DataFrame = pd.read_csv(result)[3:]
+
+        df["date_time"] = pd.to_datetime(df["dateTime:RFC3339.2"])
+
+        ticks: List[TickData] = []
+        for tp in df[3:].itertuples():
+            dt = datetime.fromtimestamp(tp[42].timestamp(), tz=DB_TZ)
+
+            tick = TickData(
+                symbol=symbol,
+                exchange=exchange,
+                datetime=dt,
+                name=tp[36],
+                volume=float(tp[41]),
+                turnover=float(tp[40]),
+                open_interest=float(tp[37]),
+                last_price=float(tp[30]),
+                last_volume=float(tp[31]),
+                limit_up=float(tp[33]),
+                limit_down=float(tp[32]),
+                open_price=float(tp[38]),
+                high_price=float(tp[29]),
+                low_price=float(tp[35]),
+                pre_close=float(tp[39]),
+                bid_price_1=float(tp[19]),
+                bid_price_2=float(tp[20]),
+                bid_price_3=float(tp[21]),
+                bid_price_4=float(tp[22]),
+                bid_price_5=float(tp[23]),
+                ask_price_1=float(tp[9]),
+                ask_price_2=float(tp[10]),
+                ask_price_3=float(tp[11]),
+                ask_price_4=float(tp[12]),
+                ask_price_5=float(tp[13]),
+                bid_volume_1=float(tp[24]),
+                bid_volume_2=float(tp[25]),
+                bid_volume_3=float(tp[26]),
+                bid_volume_4=float(tp[27]),
+                bid_volume_5=float(tp[28]),
+                ask_volume_1=float(tp[14]),
+                ask_volume_2=float(tp[15]),
+                ask_volume_3=float(tp[16]),
+                ask_volume_4=float(tp[17]),
+                ask_volume_5=float(tp[18]),
+                localtime=datetime.fromtimestamp(float(tp[34])),
+                gateway_name="DB"
+            )
+            ticks.append(tick)
+
+        return ticks
+
     def delete_bar_data(
         self,
         symbol: str,
@@ -368,33 +385,38 @@ class InfluxdbDatabase(BaseDatabase):
         interval: Interval
     ) -> int:
         """删除K线数据"""
-        bind_params = {
-            "vt_symbol": generate_vt_symbol(symbol, exchange),
-            "interval": interval.value
-        }
+        vt_symbol: str = generate_vt_symbol(symbol, exchange)
 
         # 查询数量
-        query1 = (
-            "select count(close_price) from bar_data"
-            " where vt_symbol=$vt_symbol"
-            " and interval=$interval"
-        )
-        result = self.client.query(query1, bind_params=bind_params)
-        points = result.get_points()
+        query1: str = f'''
+            from(bucket: "{self.database}")
+                |> range(start: 2000-01-01T00:00:00Z, stop: {datetime.now().isoformat()}Z)
+                |> filter(fn: (r) =>
+                    r._measurement == "bar_data" and
+                    r.interval == "{interval.value}" and
+                    r.vt_symbol == "{vt_symbol}" and
+                    r._field == "close_price"
+                )
+                |> count()
+                |> yield(name: "count")
+        '''
 
-        for d in points:
-            count = d["count"]
+        df: DataFrame = self.query_api.query_data_frame(query1)
+        count = 0
+        for tp in df.itertuples():
+            count = tp._5
 
         # 删除K线数据
-        query2 = (
-            "drop series from bar_data"
-            " where vt_symbol=$vt_symbol"
-            " and interval=$interval"
+        self.delete_api.delete(
+            "2000-01-01T00:00:00Z",
+            datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            f'interval="{interval.value}" and vt_symbol="{vt_symbol}"',
+            bucket=self.database,
+            org=self.user
         )
-        self.client.query(query2, bind_params=bind_params)
 
         # 删除K线汇总数据
-        f = shelve.open(self.overview_filepath)
+        f = shelve.open(self.bar_overview_filepath)
         vt_symbol = generate_vt_symbol(symbol, exchange)
         key = f"{vt_symbol}_{interval.value}"
         if key in f:
@@ -403,88 +425,60 @@ class InfluxdbDatabase(BaseDatabase):
 
         return count
 
-    def load_tick_data(
-        self,
-        symbol: str,
-        exchange: Exchange,
-        start: datetime,
-        end: datetime,
-        fields: list
-    ) -> List[TickData]:
-        """读取TICK数据"""
-
-        query = f"""
-        from(bucket: "{self.bucket}")
-            |> range(start: start, stop: end)
-            |> filter(fn: (r) => r["_measurement"] == "tick_data")
-            |> filter(fn: (r) => r["symbol"] == "{symbol}")
-            |> filter(fn: (r) => r["exchange"] == "{exchange}")
-            |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-        """
-
-        if len(fields) > 0:
-            fields_str = ','.join([f'"{f}"' for f in fields])
-            query += f"""|> keep(columns: [{fields_str}])"""
-
-        bind_params = {
-            "start": start,
-            "end": end,
-        }
-
-        tables = self.query_api.query(query, params=bind_params, org=self.org)
-        ticks_df = pd.DataFrame([record.values for table in tables for record in table.records])
-
-        return ticks_df
-
     def delete_tick_data(
         self,
         symbol: str,
         exchange: Exchange
     ) -> int:
         """删除TICK数据"""
-        bind_params = {
-            "vt_symbol": generate_vt_symbol(symbol, exchange),
-        }
+        vt_symbol: str = generate_vt_symbol(symbol, exchange)
 
-        # 查询TICK数量
-        query1 = (
-            "select count(last_price) from tick_data"
-            " where vt_symbol=$vt_symbol"
+        # 查询数量
+        query1: str = f'''
+            from(bucket: "{self.database}")
+                |> range(start: 2000-01-01T00:00:00Z, stop: {datetime.now().isoformat()}Z)
+                |> filter(fn: (r) =>
+                    r._measurement == "tick_data" and
+                    r.vt_symbol == "{vt_symbol}" and
+                    r._field == "last_price"
+                )
+                |> count()
+                |> yield(name: "count")
+        '''
+        df: DataFrame = self.query_api.query_data_frame(query1)
+        count = 0
+        for tp in df.itertuples():
+            count = tp._5
+
+        # 删除K线数据
+        self.delete_api.delete(
+            "2000-01-01T00:00:00Z",
+            datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            f'vt_symbol="{vt_symbol}"',
+            bucket=self.database,
+            org=self.user
         )
-        result = self.client.query(query1, bind_params=bind_params)
-        points = result.get_points()
 
-        for d in points:
-            count = d["count"]
-
-        # 删除TICK数据
-        query2 = (
-            "drop series from tick_data"
-            " where vt_symbol=$vt_symbol"
-        )
-        self.client.query(query2, bind_params=bind_params)
+        # 删除K线汇总数据
+        f = shelve.open(self.tick_overview_filepath)
+        vt_symbol = generate_vt_symbol(symbol, exchange)
+        key = f"{vt_symbol}"
+        if key in f:
+            f.pop(key)
+        f.close()
 
         return count
 
     def get_bar_overview(self) -> List[BarOverview]:
         """查询数据库中的K线汇总信息"""
-        # 如果已有K线，但缺失汇总信息，则执行初始化
-        query = "select count(close_price) from bar_data"
-        result = self.client.query(query)
-        points = result.get_points()
-        data_count = 0
-        for d in points:
-            data_count = d["count"]
-
-        f = shelve.open(self.overview_filepath)
-        overview_count = len(f)
-
-        if data_count and not overview_count:
-            self.init_bar_overview()
-
+        f = shelve.open(self.bar_overview_filepath)
         overviews = list(f.values())
         f.close()
         return overviews
 
-
-database_manager = InfluxdbDatabase()
+    def get_tick_overview(self) -> List[TickOverview]:
+        """查询数据库中的Tick汇总信息"""
+        f = shelve.open(self.tick_overview_filepath)
+        overviews = list(f.values())
+        f.close()
+        return overviews
